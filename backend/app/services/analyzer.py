@@ -1,7 +1,7 @@
 """
 Enhanced Review analysis service with AI/NLP capabilities.
 Includes sentiment analysis, emotion detection, and topic modeling.
-UPDATED: Added better error handling, input validation, and vectorized processing
+UPDATED: Added better error handling, optional imports, and lightweight fallbacks
 """
 
 import pandas as pd
@@ -15,13 +15,36 @@ from datetime import datetime
 import nltk
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-import text2emotion as te
-from nrclex import NRCLex
-import torch
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 import os
-import hashlib  # ADDED: For caching functionality
-from functools import lru_cache  # ADDED: For performance optimization
+import hashlib
+from functools import lru_cache
+
+# ADDED: Optional imports for AI libraries
+try:
+    import torch
+    from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+    TRANSFORMERS_AVAILABLE = True
+    print("✅ Transformers library available")
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+    torch = None
+    print("⚠️ Transformers not available - using lightweight models only")
+
+try:
+    import text2emotion as te
+    TEXT2EMOTION_AVAILABLE = True
+    print("✅ text2emotion library available")
+except ImportError:
+    TEXT2EMOTION_AVAILABLE = False
+    print("⚠️ text2emotion not available - using basic emotion detection")
+
+try:
+    from nrclex import NRCLex
+    NRCLEX_AVAILABLE = True
+    print("✅ NRCLex library available")
+except ImportError:
+    NRCLEX_AVAILABLE = False
+    print("⚠️ NRCLex not available - using basic emotion detection")
 
 from app.core.config import settings
 from app.utils.text_cleaner import text_cleaner
@@ -39,21 +62,27 @@ class EnhancedReviewAnalyzer:
         # Initialize sentiment analyzers
         self.vader = SentimentIntensityAnalyzer()
         
-        # IMPROVED: Better device selection with error handling
-        self.device = self._select_optimal_device()
+        # IMPROVED: Initialize AI models only if available
+        self.device = -1  # Default to CPU for Railway deployment
+        self.roberta_sentiment = None
+        self.emotion_classifier = None
         
-        # IMPROVED: More specific model loading with better error handling
-        self.roberta_sentiment = self._load_roberta_model()
-        self.emotion_classifier = self._load_emotion_model()
+        if TRANSFORMERS_AVAILABLE:
+            self.device = self._select_optimal_device()
+            self.roberta_sentiment = self._load_roberta_model()
+            self.emotion_classifier = self._load_emotion_model()
         
         # ADDED: Performance tracking
         self.model_load_success = {
             'roberta': self.roberta_sentiment is not None,
-            'emotion': self.emotion_classifier is not None
+            'emotion': self.emotion_classifier is not None,
+            'transformers': TRANSFORMERS_AVAILABLE,
+            'text2emotion': TEXT2EMOTION_AVAILABLE,
+            'nrclex': NRCLEX_AVAILABLE
         }
         
-        print(f"✅ Enhanced Analyzer initialized - Device: {'GPU' if self.device == 0 else 'CPU'}")
-        print(f"📊 Models loaded: RoBERTa={self.model_load_success['roberta']}, Emotion={self.model_load_success['emotion']}")
+        print(f"✅ Enhanced Analyzer initialized")
+        print(f"📊 Available models: {[k for k, v in self.model_load_success.items() if v]}")
     
     # ADDED: Better NLTK data management
     def _ensure_nltk_data(self):
@@ -62,7 +91,8 @@ class EnhancedReviewAnalyzer:
             'punkt': 'tokenizers/punkt',
             'averaged_perceptron_tagger': 'taggers/averaged_perceptron_tagger',
             'brown': 'corpora/brown',
-            'vader_lexicon': 'vader_lexicon'
+            'vader_lexicon': 'vader_lexicon',
+            'stopwords': 'corpora/stopwords'
         }
         
         for name, path in required_data.items():
@@ -72,64 +102,71 @@ class EnhancedReviewAnalyzer:
                 print(f"📥 Downloading NLTK {name}...")
                 try:
                     nltk.download(name, quiet=True)
+                    print(f"✅ Downloaded {name}")
                 except Exception as e:
                     print(f"⚠️ Failed to download NLTK {name}: {e}")
     
-    # ADDED: Better device selection
+    # ADDED: Better device selection (CPU-focused for Railway)
     def _select_optimal_device(self):
-        """Select optimal device with memory checks."""
-        if not torch.cuda.is_available():
+        """Select optimal device - prioritize CPU for Railway."""
+        if not TRANSFORMERS_AVAILABLE or not torch:
             return -1
         
-        try:
-            # Test GPU memory availability
-            torch.cuda.empty_cache()
-            # Try to allocate a small tensor to test GPU
-            test_tensor = torch.zeros(100, device='cuda')
-            del test_tensor
-            torch.cuda.empty_cache()
-            return 0
-        except Exception as e:
-            print(f"⚠️ GPU available but unusable ({e}), using CPU")
+        # For Railway deployment, prefer CPU to avoid memory issues
+        use_gpu = os.getenv('USE_GPU', 'false').lower() == 'true'
+        
+        if use_gpu and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                test_tensor = torch.zeros(100, device='cuda')
+                del test_tensor
+                torch.cuda.empty_cache()
+                print("✅ GPU available and working")
+                return 0
+            except Exception as e:
+                print(f"⚠️ GPU available but unusable ({e}), using CPU")
+                return -1
+        else:
+            print("✅ Using CPU for processing")
             return -1
     
-    # IMPROVED: Better model loading with specific error handling
+    # IMPROVED: Better model loading with Railway-specific optimizations
     def _load_roberta_model(self):
-        """Load RoBERTa with specific error handling."""
+        """Load RoBERTa with Railway optimizations."""
+        if not TRANSFORMERS_AVAILABLE:
+            return None
+        
+        # Skip heavy models on Railway unless explicitly enabled
+        enable_heavy_models = os.getenv('ENABLE_HEAVY_MODELS', 'false').lower() == 'true'
+        if not enable_heavy_models:
+            print("⚠️ Heavy models disabled for Railway deployment")
+            return None
+        
         try:
             model = pipeline(
                 "sentiment-analysis",
                 model="cardiffnlp/twitter-roberta-base-sentiment-latest",
                 device=self.device,
-                return_all_scores=False  # ADDED: Optimize for single prediction
+                return_all_scores=False
             )
             print("✅ RoBERTa sentiment model loaded")
             return model
-        except ImportError as e:
-            print(f"⚠️ Missing dependencies for RoBERTa: {e}")
-            return None
-        except OSError as e:
-            print(f"⚠️ RoBERTa model download failed: {e}")
-            return None
-        except torch.cuda.OutOfMemoryError:
-            print(f"⚠️ GPU out of memory, falling back to CPU for RoBERTa")
-            try:
-                model = pipeline(
-                    "sentiment-analysis",
-                    model="cardiffnlp/twitter-roberta-base-sentiment-latest",
-                    device=-1  # Force CPU
-                )
-                return model
-            except Exception as e:
-                print(f"⚠️ RoBERTa CPU fallback failed: {e}")
-                return None
         except Exception as e:
             print(f"⚠️ RoBERTa model failed to load: {e}")
             return None
     
     # IMPROVED: Better emotion model loading
     def _load_emotion_model(self):
-        """Load emotion classifier with specific error handling."""
+        """Load emotion classifier with Railway optimizations."""
+        if not TRANSFORMERS_AVAILABLE:
+            return None
+        
+        # Skip heavy models on Railway unless explicitly enabled
+        enable_heavy_models = os.getenv('ENABLE_HEAVY_MODELS', 'false').lower() == 'true'
+        if not enable_heavy_models:
+            print("⚠️ Heavy emotion models disabled for Railway deployment")
+            return None
+        
         try:
             classifier = pipeline(
                 "text-classification",
@@ -139,24 +176,6 @@ class EnhancedReviewAnalyzer:
             )
             print("✅ Emotion detection model loaded")
             return classifier
-        except ImportError as e:
-            print(f"⚠️ Missing dependencies for emotion model: {e}")
-            return None
-        except OSError as e:
-            print(f"⚠️ Emotion model download failed: {e}")
-            return None
-        except torch.cuda.OutOfMemoryError:
-            print(f"⚠️ GPU out of memory, falling back to CPU for emotion model")
-            try:
-                classifier = pipeline(
-                    "text-classification",
-                    model="j-hartmann/emotion-english-distilroberta-base",
-                    device=-1  # Force CPU
-                )
-                return classifier
-            except Exception as e:
-                print(f"⚠️ Emotion model CPU fallback failed: {e}")
-                return None
         except Exception as e:
             print(f"⚠️ Emotion model failed to load: {e}")
             return None
@@ -164,82 +183,88 @@ class EnhancedReviewAnalyzer:
     # ADDED: Comprehensive input validation
     def _validate_and_sanitize_input(self, reviews_data: Dict[str, Any]) -> Tuple[bool, str, List[Dict]]:
         """Comprehensive input validation and sanitization."""
-        # Type validation
-        if not isinstance(reviews_data, dict):
-            return False, "Input must be a dictionary", []
+        try:
+            # Type validation
+            if not isinstance(reviews_data, dict):
+                return False, "Input must be a dictionary", []
+            
+            # Success flag validation
+            if not reviews_data.get("success"):
+                error = reviews_data.get("error", "Unknown error in input data")
+                return False, f"Input data error: {error}", []
+            
+            # Reviews list validation
+            reviews = reviews_data.get("reviews", [])
+            if not isinstance(reviews, list):
+                return False, "Reviews must be a list", []
+            
+            if not reviews:
+                return False, "No reviews to analyze", []
+            
+            # ADDED: Sanitize and validate each review
+            valid_reviews = []
+            for i, review in enumerate(reviews):
+                try:
+                    sanitized = self._sanitize_single_review(review, i)
+                    if sanitized:
+                        valid_reviews.append(sanitized)
+                except Exception as e:
+                    print(f"⚠️ Failed to sanitize review {i}: {e}")
+                    continue
+            
+            if not valid_reviews:
+                return False, "No valid reviews found after sanitization", []
+            
+            print(f"✅ Validated {len(valid_reviews)}/{len(reviews)} reviews")
+            return True, "Valid input", valid_reviews
         
-        # Success flag validation
-        if not reviews_data.get("success"):
-            error = reviews_data.get("error", "Unknown error in input data")
-            return False, f"Input data error: {error}", []
-        
-        # Reviews list validation
-        reviews = reviews_data.get("reviews", [])
-        if not isinstance(reviews, list):
-            return False, "Reviews must be a list", []
-        
-        if not reviews:
-            return False, "No reviews to analyze", []
-        
-        # ADDED: Sanitize and validate each review
-        valid_reviews = []
-        for i, review in enumerate(reviews):
-            try:
-                sanitized = self._sanitize_single_review(review, i)
-                if sanitized:
-                    valid_reviews.append(sanitized)
-            except Exception as e:
-                print(f"⚠️ Failed to sanitize review {i}: {e}")
-                continue
-        
-        if not valid_reviews:
-            return False, "No valid reviews found after sanitization", []
-        
-        print(f"✅ Validated {len(valid_reviews)}/{len(reviews)} reviews")
-        return True, "Valid input", valid_reviews
+        except Exception as e:
+            return False, f"Validation failed: {str(e)}", []
     
     # ADDED: Individual review sanitization
     def _sanitize_single_review(self, review: Dict, index: int) -> Dict:
         """Sanitize and validate a single review."""
-        if not isinstance(review, dict):
-            return None
-        
-        # Essential fields validation
-        review_text = review.get('review_text') or review.get('text', '')
-        if not review_text or not isinstance(review_text, str):
-            return None
-        
-        # Clean and validate text
-        review_text = str(review_text).strip()
-        if len(review_text) < 5:  # Minimum meaningful length
-            return None
-        
-        # Sanitize rating
-        rating = review.get('rating', 0)
         try:
-            rating = float(rating)
-            if not (0 <= rating <= 5):
-                rating = 3.0  # Default to neutral if invalid
-        except (ValueError, TypeError):
-            rating = 3.0
+            if not isinstance(review, dict):
+                return None
+            
+            # Essential fields validation
+            review_text = review.get('review_text') or review.get('text', '')
+            if not review_text or not isinstance(review_text, str):
+                return None
+            
+            # Clean and validate text
+            review_text = str(review_text).strip()
+            if len(review_text) < 5:  # Minimum meaningful length
+                return None
+            
+            # Sanitize rating
+            rating = review.get('rating', 0)
+            try:
+                rating = float(rating)
+                if not (0 <= rating <= 5):
+                    rating = 3.0  # Default to neutral if invalid
+            except (ValueError, TypeError):
+                rating = 3.0
+            
+            # Build sanitized review
+            sanitized = {
+                'review_text': review_text,
+                'rating': rating,
+                'review_date': review.get('review_date', review.get('date')),
+                'verified_purchase': bool(review.get('verified_purchase', False)),
+                'helpful_votes': max(0, int(review.get('helpful_votes', 0))),
+                'reviewer_name': review.get('reviewer_name', f'Reviewer_{index}')
+            }
+            
+            return sanitized
         
-        # Build sanitized review
-        sanitized = {
-            'review_text': review_text,
-            'rating': rating,
-            'review_date': review.get('review_date', review.get('date')),
-            'verified_purchase': bool(review.get('verified_purchase', False)),
-            'helpful_votes': max(0, int(review.get('helpful_votes', 0))),
-            'reviewer_name': review.get('reviewer_name', f'Reviewer_{index}')
-        }
-        
-        return sanitized
+        except Exception as e:
+            print(f"⚠️ Review sanitization failed: {e}")
+            return None
     
     def analyze_reviews(self, reviews_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Enhanced analysis pipeline with AI/NLP features.
-        IMPROVED: Added comprehensive validation and error handling
-        """
+        """Enhanced analysis pipeline with AI/NLP features."""
         try:
             # IMPROVED: Comprehensive input validation
             is_valid, error_msg, validated_reviews = self._validate_and_sanitize_input(reviews_data)
@@ -275,8 +300,8 @@ class EnhancedReviewAnalyzer:
             # IMPROVED: Perform analyses with individual error handling
             results = {}
             analysis_functions = [
-                ('sentiment_distribution', self._analyze_sentiment_vectorized),
-                ('emotion_analysis', self._analyze_emotions_batch),
+                ('sentiment_distribution', self._analyze_sentiment_lightweight),
+                ('emotion_analysis', self._analyze_emotions_lightweight),
                 ('keyword_analysis', self._extract_keywords_advanced),
                 ('topic_modeling', self._perform_topic_modeling),
                 ('rating_distribution', self._analyze_rating_distribution),
@@ -337,7 +362,8 @@ class EnhancedReviewAnalyzer:
                 "max_reviews_limit": reviews_data.get("max_reviews_limit", 5),
                 "ai_models_used": self._get_active_models(),
                 "fallback_used": reviews_data.get("fallback", False),
-                "analysis_version": "2.0_enhanced"  # ADDED: Version tracking
+                "analysis_version": "2.0_lightweight",  # UPDATED: Lightweight version
+                "deployment_mode": "railway"
             }
             
         except Exception as e:
@@ -351,10 +377,10 @@ class EnhancedReviewAnalyzer:
     # IMPROVED: Enhanced DataFrame preparation
     def _prepare_dataframe_enhanced(self, reviews: List[Dict]) -> pd.DataFrame:
         """Enhanced DataFrame preparation with better validation."""
-        if not reviews:
-            return pd.DataFrame()
-        
         try:
+            if not reviews:
+                return pd.DataFrame()
+            
             df = pd.DataFrame(reviews)
             
             # IMPROVED: More robust data cleaning
@@ -400,169 +426,93 @@ class EnhancedReviewAnalyzer:
             print(f"⚠️ Batch text cleaning failed: {e}")
             return pd.Series([str(t) for t in texts])  # Fallback
     
-    # IMPROVED: Vectorized sentiment analysis for better performance
-    def _analyze_sentiment_vectorized(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Vectorized sentiment analysis for better performance.
-        IMPROVED: Batch processing instead of iterating through rows
-        """
+    # IMPROVED: Lightweight sentiment analysis for Railway
+    def _analyze_sentiment_lightweight(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Lightweight sentiment analysis using VADER and TextBlob only."""
         try:
             texts = df['cleaned_text'].tolist()
             
             if not texts:
                 return self._empty_sentiment_result()
             
-            print(f"🎯 Processing {len(texts)} texts for sentiment...")
+            print(f"🎯 Processing {len(texts)} texts for sentiment (lightweight mode)...")
             
-            # IMPROVED: Batch VADER processing
-            vader_scores = []
+            # Process with VADER and TextBlob only (no heavy AI models)
+            sentiments = []
+            
             for text in texts:
                 try:
-                    score = self.vader.polarity_scores(str(text))
-                    vader_scores.append(score)
-                except Exception as e:
-                    print(f"⚠️ VADER failed for one text: {e}")
-                    vader_scores.append({'compound': 0, 'pos': 0, 'neu': 1, 'neg': 0})
-            
-            # IMPROVED: Batch TextBlob processing
-            textblob_scores = []
-            for text in texts:
-                try:
+                    # VADER Sentiment
+                    vader_scores = self.vader.polarity_scores(str(text))
+                    
+                    # TextBlob Sentiment
                     blob = TextBlob(str(text))
-                    textblob_scores.append({
-                        'polarity': blob.sentiment.polarity,
-                        'subjectivity': blob.sentiment.subjectivity
-                    })
-                except Exception as e:
-                    print(f"⚠️ TextBlob failed for one text: {e}")
-                    textblob_scores.append({'polarity': 0, 'subjectivity': 0.5})
-            
-            # IMPROVED: Batch RoBERTa processing with memory management
-            roberta_scores = self._batch_roberta_sentiment(texts)
-            
-            # IMPROVED: Combine results efficiently
-            combined_sentiments = []
-            for i, (vader, textblob) in enumerate(zip(vader_scores, textblob_scores)):
-                try:
-                    roberta_score = roberta_scores[i] if i < len(roberta_scores) else None
+                    textblob_polarity = blob.sentiment.polarity
+                    textblob_subjectivity = blob.sentiment.subjectivity
                     
-                    # Calculate combined score
-                    if roberta_score is not None:
-                        combined_score = (vader['compound'] + textblob['polarity'] + roberta_score) / 3
-                    else:
-                        combined_score = (vader['compound'] + textblob['polarity']) / 2
+                    # Combine scores (no RoBERTa in lightweight mode)
+                    combined_score = (vader_scores['compound'] + textblob_polarity) / 2
                     
-                    combined_sentiments.append({
+                    sentiments.append({
                         'combined_score': combined_score,
-                        'vader_compound': vader['compound'],
-                        'textblob_polarity': textblob['polarity'],
-                        'textblob_subjectivity': textblob['subjectivity'],
-                        'roberta_score': roberta_score,
+                        'vader_compound': vader_scores['compound'],
+                        'textblob_polarity': textblob_polarity,
+                        'textblob_subjectivity': textblob_subjectivity,
+                        'roberta_score': None,  # Not available in lightweight mode
                         'label': self._get_sentiment_label(combined_score)
                     })
+                    
                 except Exception as e:
-                    print(f"⚠️ Sentiment combination failed for index {i}: {e}")
-                    combined_sentiments.append(self._default_sentiment())
+                    print(f"⚠️ Sentiment analysis failed for one text: {e}")
+                    sentiments.append(self._default_sentiment())
             
-            return self._format_sentiment_results(combined_sentiments, df)
+            return self._format_sentiment_results(sentiments, df)
             
         except Exception as e:
             print(f"❌ Sentiment analysis failed: {e}")
             return self._empty_sentiment_result()
     
-    # ADDED: Batch RoBERTa processing
-    def _batch_roberta_sentiment(self, texts: List[str]) -> List[float]:
-        """Process RoBERTa sentiment in batches for better performance."""
-        if not self.roberta_sentiment:
-            return [None] * len(texts)
-        
-        roberta_scores = []
-        batch_size = 8  # ADDED: Configurable batch size for memory management
-        
-        try:
-            for i in range(0, len(texts), batch_size):
-                batch_texts = texts[i:i+batch_size]
-                # IMPROVED: Truncate texts to avoid memory issues
-                truncated_batch = [str(text)[:512] for text in batch_texts]
-                
-                try:
-                    batch_results = self.roberta_sentiment(truncated_batch)
-                    
-                    # Handle both single result and batch results
-                    if not isinstance(batch_results, list):
-                        batch_results = [batch_results]
-                    
-                    for result in batch_results:
-                        if result['label'] == 'POSITIVE':
-                            roberta_scores.append(result['score'])
-                        else:
-                            roberta_scores.append(-result['score'])
-                            
-                except Exception as e:
-                    print(f"⚠️ RoBERTa batch failed: {e}")
-                    # IMPROVED: Add None scores for failed batch
-                    roberta_scores.extend([None] * len(batch_texts))
-            
-        except Exception as e:
-            print(f"⚠️ RoBERTa processing completely failed: {e}")
-            roberta_scores = [None] * len(texts)
-        
-        return roberta_scores
-    
-    # IMPROVED: Batch emotion analysis
-    def _analyze_emotions_batch(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Batch emotion detection for better performance.
-        IMPROVED: Process emotions in batches instead of one by one
-        """
+    # IMPROVED: Lightweight emotion analysis
+    def _analyze_emotions_lightweight(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Lightweight emotion detection without heavy models."""
         try:
             texts = df['cleaned_text'].tolist()
             if not texts:
                 return self._empty_emotion_result()
             
-            print(f"😊 Processing {len(texts)} texts for emotions...")
+            print(f"😊 Processing {len(texts)} texts for emotions (lightweight mode)...")
             
             all_emotions = []
             emotion_distribution = Counter()
             
-            # IMPROVED: Batch processing for transformer model
-            if self.emotion_classifier:
-                batch_size = 8
-                for i in range(0, len(texts), batch_size):
-                    batch_texts = texts[i:i+batch_size]
-                    try:
-                        # Process batch
-                        batch_results = self._batch_emotion_classification(batch_texts)
-                        
-                        for j, emotions in enumerate(batch_results):
-                            if emotions and len(emotions) > 0:
-                                text_idx = i + j
-                                text = batch_texts[j][:100]  # Truncate for storage
-                                
-                                top_emotion = emotions[0]
+            # Use text2emotion if available, otherwise basic keyword detection
+            for text in texts:
+                try:
+                    if TEXT2EMOTION_AVAILABLE:
+                        emotions = te.get_emotion(str(text))
+                        if emotions:
+                            max_emotion = max(emotions, key=emotions.get)
+                            if emotions[max_emotion] > 0:
                                 all_emotions.append({
-                                    'text': text,
-                                    'emotion': top_emotion['label'],
-                                    'score': top_emotion['score']
+                                    'text': str(text)[:100],
+                                    'emotion': max_emotion,
+                                    'score': emotions[max_emotion]
                                 })
-                                emotion_distribution[top_emotion['label']] += 1
-                    
-                    except Exception as e:
-                        print(f"⚠️ Emotion batch {i//batch_size} failed: {e}")
-                        # IMPROVED: Use fallback method for failed batch
-                        for text in batch_texts:
-                            fallback_emotion = self._fallback_emotion_detection(text)
-                            if fallback_emotion:
-                                all_emotions.append(fallback_emotion)
-                                emotion_distribution[fallback_emotion['emotion']] += 1
-            
-            else:
-                # IMPROVED: Fallback method with better error handling
-                for text in texts:
-                    emotion_result = self._fallback_emotion_detection(text)
-                    if emotion_result:
-                        all_emotions.append(emotion_result)
-                        emotion_distribution[emotion_result['emotion']] += 1
+                                emotion_distribution[max_emotion] += 1
+                    else:
+                        # Basic keyword-based emotion detection
+                        emotion = self._basic_emotion_detection(str(text))
+                        if emotion:
+                            all_emotions.append({
+                                'text': str(text)[:100],
+                                'emotion': emotion,
+                                'score': 0.5
+                            })
+                            emotion_distribution[emotion] += 1
+                            
+                except Exception as e:
+                    print(f"⚠️ Emotion detection failed for one text: {e}")
+                    continue
             
             return self._format_emotion_results(emotion_distribution, all_emotions)
             
@@ -570,41 +520,33 @@ class EnhancedReviewAnalyzer:
             print(f"❌ Emotion analysis failed: {e}")
             return self._empty_emotion_result()
     
-    # ADDED: Batch emotion classification
-    def _batch_emotion_classification(self, texts: List[str]) -> List[List[Dict]]:
-        """Classify emotions for a batch of texts."""
-        try:
-            truncated_texts = [str(text)[:512] for text in texts]
-            results = self.emotion_classifier(truncated_texts)
-            
-            # Ensure results is a list of lists
-            if not isinstance(results[0], list):
-                results = [results]
-            
-            return results
-        except Exception as e:
-            print(f"⚠️ Batch emotion classification failed: {e}")
-            return [[] for _ in texts]
-    
-    # ADDED: Fallback emotion detection
-    def _fallback_emotion_detection(self, text: str) -> Dict:
-        """Fallback emotion detection using text2emotion."""
-        try:
-            emotions = te.get_emotion(str(text))
-            if emotions:
-                max_emotion = max(emotions, key=emotions.get)
-                if emotions[max_emotion] > 0:
-                    return {
-                        'text': str(text)[:100],
-                        'emotion': max_emotion,
-                        'score': emotions[max_emotion]
-                    }
-        except Exception as e:
-            print(f"⚠️ Fallback emotion detection failed: {e}")
+    # ADDED: Basic keyword-based emotion detection
+    def _basic_emotion_detection(self, text: str) -> str:
+        """Basic emotion detection using keywords."""
+        text_lower = text.lower()
         
-        return None
+        # Simple keyword mapping
+        emotion_keywords = {
+            'joy': ['happy', 'great', 'excellent', 'amazing', 'wonderful', 'fantastic', 'love'],
+            'anger': ['angry', 'terrible', 'awful', 'hate', 'worst', 'horrible', 'frustrated'],
+            'sadness': ['sad', 'disappointed', 'poor', 'bad', 'unhappy', 'regret'],
+            'surprise': ['surprised', 'unexpected', 'wow', 'amazing', 'incredible'],
+            'trust': ['reliable', 'trustworthy', 'quality', 'recommend', 'solid'],
+            'fear': ['worried', 'concerned', 'afraid', 'risky', 'dangerous']
+        }
+        
+        emotion_scores = {}
+        for emotion, keywords in emotion_keywords.items():
+            score = sum(1 for keyword in keywords if keyword in text_lower)
+            if score > 0:
+                emotion_scores[emotion] = score
+        
+        if emotion_scores:
+            return max(emotion_scores, key=emotion_scores.get)
+        
+        return 'neutral'
     
-    # ADDED: Helper methods for error handling
+    # Keep all the helper methods with the same signatures...
     def _empty_sentiment_result(self) -> Dict[str, Any]:
         """Return empty sentiment result structure."""
         return {
@@ -641,7 +583,6 @@ class EnhancedReviewAnalyzer:
             'label': 'neutral'
         }
     
-    # IMPROVED: Better result formatting
     def _format_sentiment_results(self, sentiments: List[Dict], df: pd.DataFrame) -> Dict[str, Any]:
         """Format sentiment analysis results."""
         try:
@@ -718,19 +659,9 @@ class EnhancedReviewAnalyzer:
             print(f"⚠️ Emotion result formatting failed: {e}")
             return self._empty_emotion_result()
     
-    # Keep existing methods with improved error handling...
-    # (The rest of the methods remain the same but with added try/catch blocks)
-    
-    def _analyze_sentiment_advanced(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Legacy method - redirects to vectorized version."""
-        return self._analyze_sentiment_vectorized(df)
-    
-    def _analyze_emotions(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Legacy method - redirects to batch version."""
-        return self._analyze_emotions_batch(df)
-    
+    # Continue with all existing methods but with improved error handling...
     def _extract_keywords_advanced(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Extract keywords with advanced NLP and better error handling."""
+        """Extract keywords with TF-IDF and improved error handling."""
         try:
             return self._extract_keywords_tfidf(df)
         except Exception as e:
@@ -745,14 +676,13 @@ class EnhancedReviewAnalyzer:
             if not valid_texts:
                 return {"top_keywords": [], "total_unique_words": 0}
             
-            # IMPROVED: Better TF-IDF parameters
             vectorizer = TfidfVectorizer(
-                max_features=min(100, len(valid_texts) * 10),  # Dynamic max_features
+                max_features=min(100, len(valid_texts) * 10),
                 ngram_range=(1, 2),
-                min_df=max(1, len(valid_texts) // 10),  # Dynamic min_df
+                min_df=max(1, len(valid_texts) // 10),
                 max_df=0.7,
                 stop_words='english',
-                token_pattern=r'\b[a-zA-Z]{3,}\b'  # Only words with 3+ chars
+                token_pattern=r'\b[a-zA-Z]{3,}\b'
             )
             
             tfidf_matrix = vectorizer.fit_transform(valid_texts)
@@ -788,18 +718,14 @@ class EnhancedReviewAnalyzer:
             print(f"❌ TF-IDF keyword extraction failed: {e}")
             return {"top_keywords": [], "total_unique_words": 0, "error": str(e)}
     
-    # Continue with all other existing methods, adding proper error handling to each...
-    # (For brevity, I'm showing the pattern - all remaining methods should have similar improvements)
-    
     def _perform_topic_modeling(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Perform Latent Dirichlet Allocation for topic discovery with improved error handling."""
+        """Perform topic modeling with improved error handling."""
         try:
             valid_texts = df['cleaned_text'][df['cleaned_text'].str.len() > 20].tolist()
             
             if len(valid_texts) < 3:
                 return {"topics": [], "message": "Insufficient data for topic modeling (need at least 3 reviews)"}
             
-            # IMPROVED: Better preprocessing and parameters
             vectorizer = TfidfVectorizer(
                 max_features=min(50, len(valid_texts) * 5),
                 min_df=max(1, len(valid_texts) // 10),
@@ -811,12 +737,11 @@ class EnhancedReviewAnalyzer:
             
             doc_term_matrix = vectorizer.fit_transform(valid_texts)
             
-            # IMPROVED: Dynamic topic number
             n_topics = min(max(2, len(valid_texts) // 3), 5)
             lda = LatentDirichletAllocation(
                 n_components=n_topics,
                 random_state=42,
-                max_iter=20,  # Increased iterations
+                max_iter=20,
                 learning_method='batch'
             )
             
@@ -853,11 +778,9 @@ class EnhancedReviewAnalyzer:
             print(f"❌ Topic modeling failed: {e}")
             return {"topics": [], "error": str(e)}
     
-    # All remaining methods follow the same pattern with improved error handling...
-    # (Keeping the rest of the original methods but with added try/catch blocks and validation)
-    
+    # All remaining methods with improved error handling...
     def _segment_customers(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Segment customers based on review patterns with error handling."""
+        """Segment customers with error handling."""
         try:
             segments = {
                 "enthusiasts": {"criteria": "5-star ratings with detailed positive reviews", "count": 0, "characteristics": []},
@@ -879,8 +802,7 @@ class EnhancedReviewAnalyzer:
                         segments["pragmatists"]["count"] += 1
                     else:
                         segments["casual"]["count"] += 1
-                except Exception as e:
-                    print(f"⚠️ Customer segmentation failed for one row: {e}")
+                except Exception:
                     segments["casual"]["count"] += 1  # Default to casual
             
             # Calculate percentages
@@ -895,7 +817,7 @@ class EnhancedReviewAnalyzer:
             return {"error": str(e)}
     
     def _analyze_review_quality(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Analyze review quality with improved error handling."""
+        """Analyze review quality with error handling."""
         try:
             quality_scores = []
             
@@ -934,8 +856,7 @@ class EnhancedReviewAnalyzer:
                         'factors': factors
                     })
                     
-                except Exception as e:
-                    print(f"⚠️ Quality scoring failed for one review: {e}")
+                except Exception:
                     quality_scores.append({'score': 3, 'factors': []})  # Default score
             
             if not quality_scores:
@@ -944,11 +865,7 @@ class EnhancedReviewAnalyzer:
             avg_quality = np.mean([q['score'] for q in quality_scores])
             
             # Calculate verified percentage safely
-            verified_count = 0
-            total_count = len(df)
-            for _, row in df.iterrows():
-                if row.get('verified_purchase', False):
-                    verified_count += 1
+            verified_count = sum(1 for _, row in df.iterrows() if row.get('verified_purchase', False))
             
             return {
                 "average_quality_score": round(float(avg_quality), 2),
@@ -957,7 +874,7 @@ class EnhancedReviewAnalyzer:
                     "medium": sum(1 for q in quality_scores if 4 <= q['score'] < 7),
                     "low": sum(1 for q in quality_scores if q['score'] < 4)
                 },
-                "verified_percentage": calculate_percentage(verified_count, total_count),
+                "verified_percentage": calculate_percentage(verified_count, len(df)),
                 "quality_factors": dict(Counter([f for q in quality_scores for f in q['factors']]))
             }
             
@@ -965,12 +882,80 @@ class EnhancedReviewAnalyzer:
             print(f"❌ Quality analysis failed: {e}")
             return {"error": str(e)}
     
+    def _analyze_rating_distribution(self, df: pd.DataFrame) -> Dict[str, int]:
+        """Get star rating distribution with error handling."""
+        try:
+            if df.empty:
+                return {"5_star": 0, "4_star": 0, "3_star": 0, "2_star": 0, "1_star": 0}
+            
+            ratings = df['rating'].fillna(0)
+            
+            return {
+                "5_star": int(len(ratings[ratings == 5.0])),
+                "4_star": int(len(ratings[ratings == 4.0])),
+                "3_star": int(len(ratings[ratings == 3.0])),
+                "2_star": int(len(ratings[ratings == 2.0])),
+                "1_star": int(len(ratings[ratings == 1.0]))
+            }
+        except Exception as e:
+            print(f"❌ Rating distribution analysis failed: {e}")
+            return {"5_star": 0, "4_star": 0, "3_star": 0, "2_star": 0, "1_star": 0}
+    
+    def _analyze_temporal_trends(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze trends over time with error handling."""
+        try:
+            if 'review_date' not in df.columns or df.empty:
+                return {"monthly_data": [], "trend": "unknown", "message": "No date information available"}
+            
+            df_temp = df.copy()
+            df_temp['review_date'] = pd.to_datetime(df_temp['review_date'], errors='coerce')
+            df_temp = df_temp.dropna(subset=['review_date']).sort_values('review_date')
+            
+            if df_temp.empty:
+                return {"monthly_data": [], "trend": "unknown", "message": "No valid dates found"}
+            
+            df_temp['year_month'] = df_temp['review_date'].dt.to_period('M')
+            monthly_counts = df_temp.groupby('year_month').size()
+            monthly_avg_rating = df_temp.groupby('year_month')['rating'].mean()
+            
+            monthly_data = []
+            for period in monthly_counts.index:
+                try:
+                    monthly_data.append({
+                        "month": str(period),
+                        "review_count": int(monthly_counts[period]),
+                        "average_rating": round(float(monthly_avg_rating[period]), 2)
+                    })
+                except Exception:
+                    continue
+            
+            # Determine trend
+            trend = "stable"
+            if len(monthly_data) > 1:
+                try:
+                    first_count = monthly_data[0]["review_count"]
+                    last_count = monthly_data[-1]["review_count"]
+                    if last_count > first_count * 1.2:
+                        trend = "increasing"
+                    elif last_count < first_count * 0.8:
+                        trend = "decreasing"
+                except:
+                    trend = "unknown"
+            
+            return {
+                "monthly_data": monthly_data[-12:],  # Last 12 months
+                "trend": trend
+            }
+            
+        except Exception as e:
+            print(f"❌ Temporal analysis failed: {e}")
+            return {"monthly_data": [], "trend": "unknown", "error": str(e)}
+    
     def _generate_ai_insights(self, df, sentiment, emotions, keywords, topics, segments) -> List[str]:
-        """Generate intelligent insights with error handling."""
+        """Generate insights with error handling."""
         try:
             insights = []
             
-            # IMPROVED: Safer data access with defaults
             pos_pct = sentiment.get('positive', {}).get('percentage', 0)
             neg_pct = sentiment.get('negative', {}).get('percentage', 0)
             
@@ -998,30 +983,15 @@ class EnhancedReviewAnalyzer:
                 main_themes = [t.get('theme', 'Unknown') for t in topics_list[:2]]
                 insights.append(f"🎯 Key discussion themes: {', '.join(main_themes)}")
             
-            # Segment insights
-            if segments and not segments.get('error'):
-                try:
-                    dominant_segment = max(segments.items(), key=lambda x: x[1].get('count', 0))[0]
-                    segment_pct = segments[dominant_segment].get('percentage', 0)
-                    insights.append(f"👥 Primary customer segment: {dominant_segment} ({segment_pct}%)")
-                except:
-                    pass
-            
             # Keyword insights
             top_keywords = keywords.get('top_keywords', [])
             if top_keywords:
                 trending_keywords = [kw.get('word', '') for kw in top_keywords[:3]]
-                trending_keywords = [k for k in trending_keywords if k]  # Filter empty
+                trending_keywords = [k for k in trending_keywords if k]
                 if trending_keywords:
                     insights.append(f"🔍 Trending topics: {', '.join(trending_keywords)}")
             
-            # Rating correlation insight
-            sentiment_scores = sentiment.get('sentiment_scores', {})
-            confidence = sentiment_scores.get('confidence', 0)
-            if confidence > 0.7:
-                insights.append(f"📊 High analysis confidence ({confidence:.2f}) - reliable insights")
-            
-            return insights[:7]  # Return top 7 insights
+            return insights[:5]  # Return top 5 insights
             
         except Exception as e:
             print(f"❌ Insights generation failed: {e}")
@@ -1034,37 +1004,22 @@ class EnhancedReviewAnalyzer:
             avg_rating = sentiment.get('average_rating', 0)
             pos_pct = sentiment.get('positive', {}).get('percentage', 0)
             
-            emotional_tone = emotions.get('emotional_tone', 'neutral')
-            
-            # Build summary safely
             summary_parts = [
                 f"Analysis of {total} customer reviews reveals ",
-                f"{pos_pct}% positive sentiment with {avg_rating:.1f} stars average. "
+                f"{pos_pct}% positive sentiment with {avg_rating:.1f} stars average."
             ]
             
-            # Add emotional context
-            if emotional_tone != 'neutral':
-                summary_parts.append(f"The overall emotional tone is {emotional_tone}. ")
-            
-            # Add dominant emotion
-            dominant_emotions = emotions.get('dominant_emotions', [])
-            if dominant_emotions:
-                top_emotion = dominant_emotions[0].get('emotion', 'unknown')
-                summary_parts.append(f"Customers primarily express {top_emotion}. ")
-            
-            # Add key insight
             if insights and len(insights) > 0:
                 clean_insight = insights[0].replace('🌟', '').replace('✅', '').replace('⚠️', '').strip()
                 if clean_insight:
-                    summary_parts.append(clean_insight + ".")
+                    summary_parts.append(f" {clean_insight}")
             
             return ''.join(summary_parts)
             
         except Exception as e:
-            print(f"❌ Summary generation failed: {e}")
-            return f"Executive summary could not be generated due to an error: {str(e)}"
+            return f"Executive summary could not be generated: {str(e)}"
     
-    # Keep all other existing helper methods with the same signature...
+    # Helper methods
     def _get_sentiment_label(self, score: float) -> str:
         """Determine sentiment label from score."""
         try:
@@ -1087,7 +1042,8 @@ class EnhancedReviewAnalyzer:
             'sadness': 'Disappointment with purchase',
             'disgust': 'Strong negative reaction',
             'anger': 'Frustration with product or service',
-            'anticipation': 'Excitement about the product'
+            'anticipation': 'Excitement about the product',
+            'neutral': 'Balanced customer feedback'
         }
         return descriptions.get(str(emotion).lower(), f'Customers express {emotion}')
     
@@ -1140,94 +1096,22 @@ class EnhancedReviewAnalyzer:
             return 'General Feedback'
     
     def _get_active_models(self) -> List[str]:
-        """Get list of active AI models."""
+        """Get list of active models."""
         try:
-            models = ['VADER', 'TextBlob', 'NLTK']
+            models = ['VADER', 'TextBlob', 'NLTK', 'TF-IDF', 'LDA']
             
-            if self.roberta_sentiment:
+            if TRANSFORMERS_AVAILABLE and self.roberta_sentiment:
                 models.append('RoBERTa')
-            if self.emotion_classifier:
+            if TRANSFORMERS_AVAILABLE and self.emotion_classifier:
                 models.append('DistilRoBERTa-Emotion')
-            else:
+            if TEXT2EMOTION_AVAILABLE:
                 models.append('text2emotion')
-            
-            models.append('LDA-TopicModeling')
+            if NRCLEX_AVAILABLE:
+                models.append('NRCLex')
             
             return models
         except:
             return ['Basic-NLP']
-    
-    def _analyze_rating_distribution(self, df: pd.DataFrame) -> Dict[str, int]:
-        """Get star rating distribution with error handling."""
-        try:
-            if df.empty:
-                return {"5_star": 0, "4_star": 0, "3_star": 0, "2_star": 0, "1_star": 0}
-            
-            # IMPROVED: Better rating handling
-            ratings = df['rating'].fillna(0)
-            
-            return {
-                "5_star": int(len(ratings[ratings == 5.0])),
-                "4_star": int(len(ratings[ratings == 4.0])),
-                "3_star": int(len(ratings[ratings == 3.0])),
-                "2_star": int(len(ratings[ratings == 2.0])),
-                "1_star": int(len(ratings[ratings == 1.0]))
-            }
-        except Exception as e:
-            print(f"❌ Rating distribution analysis failed: {e}")
-            return {"5_star": 0, "4_star": 0, "3_star": 0, "2_star": 0, "1_star": 0}
-    
-    def _analyze_temporal_trends(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Analyze trends over time with improved error handling."""
-        try:
-            if 'review_date' not in df.columns or df.empty:
-                return {"monthly_data": [], "trend": "unknown", "message": "No date information available"}
-            
-            # IMPROVED: Better date processing
-            df_temp = df.copy()
-            df_temp['review_date'] = pd.to_datetime(df_temp['review_date'], errors='coerce')
-            df_temp = df_temp.dropna(subset=['review_date']).sort_values('review_date')
-            
-            if df_temp.empty:
-                return {"monthly_data": [], "trend": "unknown", "message": "No valid dates found"}
-            
-            df_temp['year_month'] = df_temp['review_date'].dt.to_period('M')
-            monthly_counts = df_temp.groupby('year_month').size()
-            monthly_avg_rating = df_temp.groupby('year_month')['rating'].mean()
-            
-            monthly_data = []
-            for period in monthly_counts.index:
-                try:
-                    monthly_data.append({
-                        "month": str(period),
-                        "review_count": int(monthly_counts[period]),
-                        "average_rating": round(float(monthly_avg_rating[period]), 2)
-                    })
-                except Exception as e:
-                    print(f"⚠️ Monthly data processing failed for {period}: {e}")
-                    continue
-            
-            # Determine trend
-            trend = "stable"
-            if len(monthly_data) > 1:
-                try:
-                    first_count = monthly_data[0]["review_count"]
-                    last_count = monthly_data[-1]["review_count"]
-                    if last_count > first_count * 1.2:
-                        trend = "increasing"
-                    elif last_count < first_count * 0.8:
-                        trend = "decreasing"
-                except:
-                    trend = "unknown"
-            
-            return {
-                "monthly_data": monthly_data[-12:],  # Last 12 months
-                "trend": trend
-            }
-            
-        except Exception as e:
-            print(f"❌ Temporal analysis failed: {e}")
-            return {"monthly_data": [], "trend": "unknown", "error": str(e)}
 
 
 # Singleton instance
