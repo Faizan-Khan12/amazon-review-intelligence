@@ -8,6 +8,9 @@ pydantic==2.5.0
 pandas==2.1.3
 numpy==1.24.3
 
+# Machine Learning (REQUIRED)
+scikit-learn==1.3.2
+
 # Basic NLP (lightweight)
 nltk==3.8.1
 textblob==0.17.1
@@ -16,3 +19,10 @@ vaderSentiment==3.3.2
 # API requests
 httpx==0.25.1
 requests==2.31.0
+
+# Apify Client (REQUIRED)
+apify-client==1.7.1
+
+# Additional dependencies that might be needed
+beautifulsoup4==4.12.2
+lxml==4.9.3
